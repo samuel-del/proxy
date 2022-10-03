@@ -1,0 +1,421 @@
+# Filename: proxy.py
+# Group of 2:
+#   Samuel Tessema
+#   Gaymer Barrios
+# Description:
+#   A simple proxy application sends a client requests to a server
+#   and sends the server's reponse to the clinet.
+#   Includes: Multiprocessing, Caching, Error handling
+# Usage:
+#   python proxy.py server_port
+#   Example:
+#       terminal: python proxy.py 7000
+#       browser: http://localhost:7000/www.example.com
+# Last Updated and status:
+#   Feb 10: Basic proxy, multiprocessing, caching, error handling
+
+from multiprocessing import Process
+from socket import *
+import logging
+import os
+import re
+import shutil
+import sys
+
+logging.basicConfig(level=logging.INFO)
+
+
+# Reads data from a socket
+# and returns it in a byte string
+def recvall(target_socket):
+    # print("---Jumped to recvall()")
+    socket_timeout = 5  # 5 seconds
+
+    socket_msg = b""
+    response_chunk = b""
+
+    chunk_size = 4096
+    chunk_ndx = 1
+    # print("---The default chunk_size = ", chunk_size)
+
+    try:
+        # print("---Attempting to receive chunk #{} of size = {}".format(chunk_ndx, chunk_size))
+        # print("---The target_socket timeout is set to {} seconds".format(socket_timeout))
+        target_socket.settimeout(socket_timeout)
+        response_chunk = target_socket.recv(chunk_size)
+        # print("---Succeded receiving chunk #{}".format(chunk_ndx))
+        # print("---len(chunk) #{} = {}".format(chunk_ndx, len(response_chunk)))
+        # print("---The chunk #{}:\n".format(chunk_ndx))
+        # print(response_chunk)
+        # print("-------------\n")
+        # print("---Writting chunk #{} to socket_msg...".format(chunk_ndx))
+        socket_msg += response_chunk
+        # print("---Current len(socket_msg) as a byte string = ", len(socket_msg))
+        chunk_ndx += 1
+
+        while len(response_chunk) > 0:
+            # print("---Attempting to receive chunk #{} of size = {}".format(chunk_ndx, chunk_size))
+            # print("---The target_socket timeout is set to {} seconds".format(socket_timeout))
+            target_socket.settimeout(socket_timeout)
+            response_chunk = target_socket.recv(chunk_size)
+            # print("---Succeded receiving chunk #{}".format(chunk_ndx))
+            # print("---len(chunk) #{} = {}".format(chunk_ndx, len(response_chunk)))
+            # print("---The chunk #{}:\n".format(chunk_ndx))
+            # print(response_chunk)
+            # print("-------------\n")
+            # print("---Writting chunk #{} to socket_msg...".format(chunk_ndx))
+            socket_msg += response_chunk
+            # print("---Current len(socket_msg) as a byte string = ", len(socket_msg))
+            chunk_ndx += 1
+
+    except error as e:
+        # print("---Error reading response")
+        # print(e)
+        pass
+
+    # print("---Final len(socket_msg) as a byte string = ", len(socket_msg))
+    # print("---Returning from recvall()")
+    return socket_msg
+
+
+# Closes the socket given as an argument
+def close_socket(socket_str_name, socket_to_close):
+    socket_to_close.close()
+    # logging.info("---{} socket closed...".format(socket_str_name))
+    return
+
+
+# Builds a string used for an http response for error handling
+def error_str_builder(status_code, error_msg):
+    error_response = "HTTP/1.1 {}\r\n".format(status_code)
+    error_response += "Content-Type:text/html\r\n\r\n"
+    error_response += '<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 2.0//EN">'
+    error_response += '<html><head>'
+    error_response += '<title>{}</title>'.format(status_code)
+    error_response += '</head><body>'
+    error_response += '<h1>Error with client request</h1>'
+    error_response += '<p>{}</p>'.format(status_code)
+    error_response += '<p>{}</p>'.format(error_msg)
+    error_response += '<p>Proxy CP372</p>'
+    error_response += '</body></html>'
+    return error_response
+
+
+# Accepts a client request and uses cache or a server connection to get
+# an http response for the client
+def client_handler(client_socket, client_address, cache_dir_name):
+    #----------------------------
+    #  Getting a Client request
+    #----------------------------
+    try:
+        # logging.info("---Attempting to receive a Client request...")
+        client_request = recvall(client_socket)
+        # logging.info("---[{}] client sent a request...".format(client_address))
+    except error as e:
+        # logging.info("---Error receiving the request of client [{}]".format(client_address))
+        # logging.info(e)
+        close_socket("Client", client_socket)
+        return
+
+    # Checking Socket message (in bytes)
+    # logging.info("---len(request) as a byte string = {}".format(len(client_request)))
+    # logging.info("---The request as a byte string:\n")
+    # logging.info(client_request)
+    # logging.info("--------------------------------\n")
+
+    # Checking Socket message (as a string)
+    # logging.info("---[{}] client request: len(request) as a string = {}".format(client_address, len(client_request.decode())))
+    # logging.info("---The request as a string:\n")
+    # logging.info(client_request.decode())
+    # logging.info("--------------------------------\n")
+
+    # Extract the requested filename from the Client message
+    # logging.info("---Attempting to extract the client request filename...")
+    message = client_request.decode()
+    # logging.info("---Checking for empty Client request...")
+    if(len(message) <= 0):
+        # logging.info("---[{}] client sent an empty Client request...".format(client_address))
+        # Close Client communication
+        close_socket("Client", client_socket)
+        return
+
+    # logging.info("---message.split()[1] = {}".format(message.split()[1]))
+    client_request_filename = message.split()[1].partition("/")[2]
+    # logging.info("---[{}] client requested: {}".format(client_address, client_request_filename))
+
+    # logging.info("---Checking filename path...")
+    referer_flag = message.find("Referer:")
+    client_request_fullpath = ""
+
+    if(referer_flag > 0):
+        # logging.info("---Found a Referer link...")
+        referer_filename = re.search('Referer:\shttp://localhost:\d\d\d\d/(.+)\r\n', message)
+        referer_filename = referer_filename.group(1)
+        # logging.info("---Referer: {}".format(referer_filename))
+        client_request_fullpath = referer_filename + '/' + client_request_filename
+        # logging.info("---[{}] client request fullpath: {}".format(client_address,client_request_fullpath))
+
+        # Get the filename and host hostname
+        # logging.info("---Getting the filename and hostname...")
+        full_path = client_request_fullpath
+        hostname, separator, filename = full_path.partition('/')
+        # logging.info("---The hostname: {}".format(hostname))
+        # logging.info("---The filename: {}".format(filename))
+    else:
+        # There is no Referer header
+        hostname = client_request_filename.partition('/')[0]
+        filename = client_request_filename.partition('/')[2]
+        client_request_fullpath = hostname + '/' + filename
+        # logging.info("---The hostname: {}".format(hostname))
+        # logging.info("---The filename: {}".format(filename))
+
+    #------------------------------------------
+    #  Check if client's request is cache
+    #------------------------------------------
+    # logging.info("---Checking if client request filename [{}] is in cache...".format(filename))
+    cache_file_name = client_request_fullpath
+    # Replace foward slashes (invalid name for windows files)
+    cache_file_name = cache_file_name.replace('/', '_')
+    path = "./" + cache_dir_name + '/' + cache_file_name
+    # logging.info("path to check: {}".format(path))
+
+    if(os.path.exists(path)):
+        # logging.info("---The requested filename is in cache...")
+        # Open file to read as binary
+        file_handler = open(path, "rb")
+
+        # Read file data
+        cache_request = file_handler.readlines()
+        # print(cache_request)
+
+        # Send file to client
+        # cache_response = "HTTP/1.1 200\r\n"
+        # cache_response += "Content-Type:text/html\r\n\r\n"
+
+        # client_socket.sendall(cache_response.encode())
+
+        # alreday has the above lines
+        for line in cache_request:
+            client_socket.sendall(line)
+
+        logging.info("---Request found in cache...")
+        # Close sockets
+        close_socket("Client", client_socket)
+        return
+    else:
+        # logging.info("---The requested filename is not in cache...")
+        pass
+
+        #------------------------------------------
+        #  Proxy sends client's request to server
+        #------------------------------------------
+        # Get the requested filename from a server
+        # Create proxy client socket and connect to the requested target_server
+        target_server = hostname
+        target_server_port = 80
+
+        try:
+            # logging.info("---Attempting to send client [{}] request to: {}".format(client_address, target_server))
+            proxy_client_socket = socket(AF_INET, SOCK_STREAM)
+            # logging.info("---Proxy Client socket created...")
+            proxy_client_socket.connect((target_server, target_server_port))
+            # logging.info("---Connection estabished...")
+        except error as e:
+            # logging.info("---Error connecting to server...")
+            # logging.info(e)
+            # logging.info("after")
+            error_response = error_str_builder("400 Bad Request", "Failed to stablish a connection to the given server.")
+            client_socket.settimeout(2)
+            client_socket.sendall(error_response.encode())
+            # logging.info('here')
+            close_socket("Proxy Client", proxy_client_socket)
+            close_socket("Client", client_socket)
+            return
+
+        # Use the Proxy Server to send the Client request to a server
+        # logging.info("---Proxy Server attempting to send a request...")
+        proxy_client_request = "GET /" + filename + " HTTP/1.1\r\n"
+        proxy_client_request += "Host: " + hostname + "\r\n\r\n"
+
+        # logging.info("---The Proxy Client request to server:\n")
+        # logging.info(proxy_client_request)
+        # logging.info("----------------------------\n")
+
+        try:
+            proxy_client_socket.sendall(proxy_client_request.encode())
+            # logging.info("---[{}] client Request sent to server...".format(client_address))
+        except error as e:
+            # logging.info("---Error sending the request client [{}] request...".format(client_address))
+            # logging.info(e)
+            close_socket("Proxy Client", proxy_client_socket)
+            close_socket("Client", client_socket)
+            return
+
+        # Read the target server response
+        # logging.info("---Proxy Client attempting to get a response from server...")
+        try:
+            target_server_response = recvall(proxy_client_socket)
+            # logging.info("---Received a response from server...")
+        except error as e:
+            # logging.info("---Error getting a response from server...")
+            # logging.info(e)
+            close_socket("Proxy Client", proxy_client_socket)
+            close_socket("Client", client_socket)
+            return
+
+        # logging.info("---Server len(response) as a byte string = {}".format(len(target_server_response)))
+        # logging.info("---The response as a byte string:\n")
+        # logging.info(target_server_response[:101])
+        # logging.info("---------------------------------\n")
+
+        # logging.info("---Server len(response) as a string = {}".format(len(target_server_response)))
+        # logging.info("---The response as a string:\n")
+        # logging.info(target_server_response.decode()[:1000])
+        # logging.info("---------------------------------\n")
+
+        #------------------------------------------
+        #  Send the Server response to the client
+        #------------------------------------------
+        status_code = target_server_response.split()[1].decode()
+        if status_code == "200":
+            try:
+                client_socket.sendall(target_server_response)
+                # logging.info("---Server's response sent to client [{}]".format(client_address))
+            except error as e:
+                # logging.info("---Error sending the Server's response to client [{}]".format(client_address))
+                # logging.info(e)
+                close_socket("Proxy Client", proxy_client_socket)
+                close_socket("Client", client_socket)
+                return
+
+            # Make a cache file
+            cache_file_name = client_request_fullpath
+            # Replace foward slashes (invalid name for windows files)
+            cache_file_name = cache_file_name.replace('/', '_')
+            # Check len is less than 255 (windows max filename length)
+            # logging.info("cache_file_name: {}".format(cache_file_name))
+            # logging.info("folder name: {}".format(cache_file_list[0]))
+            if len(cache_file_name) < 255:
+                # Create the cache file
+                try:
+                    path = "./" + cache_dir_name + '/' + cache_file_name
+                    # logging.info("the path: {}".format(path))
+                    tmpFile = open(path, "wb")
+                    # logging.info("len(target_server_response): {}".format(len(target_server_response)))
+                    tmpFile.write(target_server_response)
+                    # add cache file name to list (process sensitive)
+                    tmpFile.close()
+                except error as e:
+                    logging.info(e)
+                    logging.info("---Error making cache file")
+                    pass
+
+            close_socket("Proxy Client", proxy_client_socket)
+            close_socket("Client", client_socket)
+            return
+
+        #------------------
+        #  Error handling
+        #------------------
+        # logging.info("---Status code: {}".format(status_code))
+        if status_code == "301":
+            error_response = error_str_builder("301 Moved Permanently", "No https support.")
+            client_socket.sendall(error_response.encode())
+            close_socket("Proxy Client", proxy_client_socket)
+            close_socket("Client", client_socket)
+            return
+        elif status_code == "302":
+            error_response = error_str_builder("302 Moved Temporarily", "No https support.")
+            client_socket.sendall(error_response.encode())
+            close_socket("Proxy Client", proxy_client_socket)
+            close_socket("Client", client_socket)
+            return
+        elif status_code == "404":
+            error_response = error_str_builder("404 Not found", "Requested document not found on this server.")
+            client_socket.sendall(error_response.encode())
+            close_socket("Proxy Client", proxy_client_socket)
+            close_socket("Client", client_socket)
+            return
+        elif status_code == "500":
+            error_response = error_str_builder("500 Internal Server Error", \
+                "The server enountered an unexpected condition that prevented it from fulfilling the request.")
+            client_socket.sendall(error_response.encode())
+            close_socket("Proxy Client", proxy_client_socket)
+            close_socket("Client", client_socket)
+            return
+        else:
+            error_response = error_str_builder("400 Bad Request", "Request msg not understood by server.")
+            client_socket.sendall(error_response.encode())
+            close_socket("Proxy Client", proxy_client_socket)
+            close_socket("Client", client_socket)
+            return
+
+    return
+
+
+# The program starts here
+if __name__ == '__main__':
+    if len(sys.argv) <= 1:
+        print('Usage : python proxy.py server_port\n')
+        sys.exit(2)
+
+    # logging.info("---Proxy Server starting...")
+    proxy_server_name = ""
+    proxy_server_port = int(sys.argv[1])
+
+    # logging.info("---Checking cache folder...")
+    cache_dir_name = "cache"
+    cache_dir_path = "./" + cache_dir_name
+
+    try:
+        if os.path.exists(cache_dir_path):
+            # logging.info("---The folder [{}] was found...".format(cache_dir_name))
+            # logging.info("---Deleting current [{}] folder...".format(cache_dir_name))
+            shutil.rmtree(cache_dir_path)
+            # logging.info("---Making a cache folder in current directory...".format(cache_dir_name))
+            os.mkdir("./" + cache_dir_name)
+        else:
+            # logging.info("---No [{}] folder found. Making a cache folder in current directory...".format(cache_dir_name))
+            os.mkdir("./" + cache_dir_name)
+    except error as e:
+        logging.info(e)
+        logging.info("Error setting up cache...")
+        sys.exit(2)
+
+    # logging.info("starting: {}".format(cache_file_list))
+    # Create proxy server socket and wait for clients
+    try:
+        proxy_server_socket = socket(AF_INET, SOCK_STREAM)
+        # logging.info("---Proxy Server socket created...")
+        # logging.info("---Attempting to bind server to port {}".format(proxy_server_port))
+        proxy_server_socket.bind((proxy_server_name, proxy_server_port))
+        # print("---Succeeded binding server port...")
+        proxy_server_socket.listen(20)
+        logging.info("---Proxy Server setup completed...")
+    except error as e:
+        logging.info("---Error setting up Proxy Server")
+        logging.info(e)
+        sys.exit(2)
+
+    while True:
+        # Attempt to accept a client
+        logging.info("-"*80)
+        try:
+            logging.info("---Listening for clients on port {}...".format(proxy_server_port))
+            client_socket, client_address = proxy_server_socket.accept()
+            logging.info("---[{}] client connected...".format(client_address))
+            # print("---Client info: client_socket = {}, client_address = {}".format(client_socket, client_address))
+        except error as e:
+            logging.info("---Error while trying to accept a client...")
+            logging.info(e)
+            continue
+
+        # Spawn a new process for the client
+        logging.info("---Spawning a new process for client [{}]...".format(client_address))
+        client_process = Process(target=client_handler, args=(client_socket, client_address, cache_dir_name))
+        client_process.start()
+        # client_process.join()
+
+    # Close Proxy Server communication
+    close_socket("Proxy Server", proxy_server_socket)
+    sys.exit()
